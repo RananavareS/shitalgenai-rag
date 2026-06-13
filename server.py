@@ -276,8 +276,21 @@ def clear_history():
 
 
 # ─── In-memory document store ──────────────────────────────────────────────────
-CHUNKS: list    = []
-DOCUMENTS: list = []
+# Per-user knowledge base storage.
+# Each user (identified by email; "anonymous" if not logged in)
+# gets their own isolated CHUNKS and DOCUMENTS list.
+CHUNKS: dict    = {}   # { user_email: [ {id, doc_id, doc_name, chunk_index, text, embedding}, ... ] }
+DOCUMENTS: dict = {}   # { user_email: [ {id, name, type, chunk_count, uploaded_at}, ... ] }
+
+def _user_key(user_email):
+    """Normalize user identifier; falls back to 'anonymous'."""
+    return (user_email or "anonymous").strip().lower()
+
+def get_user_chunks(user_email):
+    return CHUNKS.setdefault(_user_key(user_email), [])
+
+def get_user_documents(user_email):
+    return DOCUMENTS.setdefault(_user_key(user_email), [])
 
 # ── Embeddings: sentence-transformers (semantic) with TF-IDF fallback ──────────
 _ST_MODEL = None
@@ -327,11 +340,12 @@ def cosine_sim(a, b):
         return cosine_sim_dict(a, b)
     return cosine_sim_vec(a, b)
 
-def retrieve(query, top_k=4):
-    if not CHUNKS: return []
+def retrieve(query, user_email, top_k=4):
+    chunks = get_user_chunks(user_email)
+    if not chunks: return []
     q = embed(query)
     scored = sorted(
-        ((cosine_sim(q, c["embedding"]), c) for c in CHUNKS),
+        ((cosine_sim(q, c["embedding"]), c) for c in chunks),
         key=lambda x: x[0],
         reverse=True,
     )
@@ -339,7 +353,7 @@ def retrieve(query, top_k=4):
     # TF-IDF gives smaller scores. Use a low-but-nonzero threshold either way.
     threshold = 0.15 if _get_st_model() else 0.001
     results = [c for s, c in scored[:top_k] if s > threshold]
-    if not results and CHUNKS:
+    if not results and chunks:
         results = [c for _, c in scored[:2]]
     return results
 
@@ -510,16 +524,20 @@ class Handler(BaseHTTPRequestHandler):
         path = self.path.split("?")[0]
         if path == "/": path = "/index.html"
 
+        # Parse query string once for any endpoint that needs it
+        params = {}
+        if "?" in self.path:
+            for p in self.path.split("?", 1)[1].split("&"):
+                if "=" in p:
+                    k, v = p.split("=", 1)
+                    from urllib.parse import unquote
+                    params[k] = unquote(v)
+
         if path == "/api/documents":
-            self._json(200, DOCUMENTS); return
+            user_email = params.get("user_email", "")
+            self._json(200, get_user_documents(user_email)); return
 
         if path == "/api/history":
-            params = {}
-            if "?" in self.path:
-                for p in self.path.split("?", 1)[1].split("&"):
-                    if "=" in p:
-                        k, v = p.split("=", 1)
-                        params[k] = v
             history = get_history(
                 session_id = params.get("session_id"),
                 user_email = params.get("user_email"),
@@ -545,15 +563,26 @@ class Handler(BaseHTTPRequestHandler):
         except Exception as e:    self._text(500, str(e))
 
     def do_DELETE(self):
-        if self.path == "/api/history":
+        path = self.path.split("?")[0]
+        params = {}
+        if "?" in self.path:
+            for p in self.path.split("?", 1)[1].split("&"):
+                if "=" in p:
+                    k, v = p.split("=", 1)
+                    from urllib.parse import unquote
+                    params[k] = unquote(v)
+
+        if path == "/api/history":
             clear_history()
             self._json(200, {"ok": True}); return
-        m = re.match(r"^/api/documents/([^/]+)$", self.path)
+
+        m = re.match(r"^/api/documents/([^/]+)$", path)
         if not m: self._json(404, {"error": "Not found"}); return
-        doc_id = m.group(1)
-        global CHUNKS, DOCUMENTS
-        CHUNKS    = [c for c in CHUNKS    if c["doc_id"] != doc_id]
-        DOCUMENTS = [d for d in DOCUMENTS if d["id"]     != doc_id]
+        doc_id     = m.group(1)
+        user_email = params.get("user_email", "")
+        key = _user_key(user_email)
+        CHUNKS[key]    = [c for c in CHUNKS.get(key, [])    if c["doc_id"] != doc_id]
+        DOCUMENTS[key] = [d for d in DOCUMENTS.get(key, []) if d["id"]     != doc_id]
         self._json(200, {"deleted": doc_id})
 
     def do_POST(self):
@@ -589,8 +618,8 @@ class Handler(BaseHTTPRequestHandler):
 
             # Build RAG context
             rag_context = ""
-            if rag_on and CHUNKS and last_user_msg:
-                hits = retrieve(last_user_msg, top_k=4)
+            if rag_on and last_user_msg and get_user_chunks(user_email):
+                hits = retrieve(last_user_msg, user_email, top_k=4)
                 if hits:
                     # Truncate each chunk's text to keep total prompt size small
                     MAX_CHUNK_CHARS = 800
@@ -654,26 +683,42 @@ class Handler(BaseHTTPRequestHandler):
     def _handle_upload(self, body):
         try:
             ct = self.headers.get("Content-Type", "")
+            user_email = ""
+
+            # user_email can also be passed via query string for multipart uploads
+            if "?" in self.path:
+                from urllib.parse import unquote
+                for pair in self.path.split("?", 1)[1].split("&"):
+                    if pair.startswith("user_email="):
+                        user_email = unquote(pair.split("=", 1)[1])
+
             if "application/json" in ct:
-                p        = json.loads(body)
-                filename = p["filename"]
-                raw      = base64.b64decode(p["data"])
+                p          = json.loads(body)
+                filename   = p["filename"]
+                raw        = base64.b64decode(p["data"])
+                user_email = p.get("user_email", user_email)
             elif "multipart/form-data" in ct:
                 filename, raw = self._parse_multipart(body, ct)
             else:
                 self._json(400, {"error": "Unsupported content-type"}); return
+
             mime = mimetypes.guess_type(filename)[0] or ""
             text = parse_text_bytes(raw, mime, filename)
             if not text.strip(): self._json(400, {"error": "No text found"}); return
+
             doc_id = hashlib.md5((filename+str(time.time())).encode()).hexdigest()[:12]
             cks    = chunk_text(text)
+
+            user_chunks = get_user_chunks(user_email)
             for i, ck in enumerate(cks):
-                CHUNKS.append({"id":f"{doc_id}_{i}","doc_id":doc_id,"doc_name":filename,
+                user_chunks.append({"id":f"{doc_id}_{i}","doc_id":doc_id,"doc_name":filename,
                                 "chunk_index":i,"text":ck,"embedding":embed(ck)})
+
             meta = {"id":doc_id,"name":filename,"type":mime or "text/plain",
                     "chunk_count":len(cks),
                     "uploaded_at":time.strftime("%Y-%m-%dT%H:%M:%SZ",time.gmtime())}
-            DOCUMENTS.append(meta)
+            get_user_documents(user_email).append(meta)
+
             self._json(200, {"ok": True, "doc": meta})
         except Exception as e:
             self._json(500, {"error": str(e)})
@@ -705,21 +750,39 @@ class Handler(BaseHTTPRequestHandler):
         self._cors(); self.end_headers(); self.wfile.write(body)
 
 
+def _init_deeplake_background():
+    """Run DeepLake initialization in a background thread so it never
+    blocks the HTTP server from starting and passing Render's health check."""
+    try:
+        init_deeplake()
+        d = f"✅ Connected ({DATASET_NAME})" if DEEPLAKE_AVAILABLE else "⚠️  Fallback (local JSON)"
+        print(f"  [Startup] DeepLake init finished: {d}")
+    except Exception as e:
+        print(f"  [Startup] DeepLake init failed (non-fatal): {e}")
+
+
 if __name__ == "__main__":
-    init_deeplake()
     k = f"✅ Loaded ({GROQ_API_KEY[:8]}...)" if GROQ_API_KEY else "❌ NOT SET"
-    d = f"✅ Connected ({DATASET_NAME})"     if DEEPLAKE_AVAILABLE else "⚠️  Fallback (local JSON)"
     print(f"""
   ╔══════════════════════════════════════════════════════════╗
   ║   ShitalGenAI — RAG + DeepLake Multi-User Edition        ║
-  ║   http://localhost:{PORT}                                   ║
+  ║   http://0.0.0.0:{PORT}                                     ║
   ╠══════════════════════════════════════════════════════════╣
   ║   GROQ_API_KEY : {k:<39}║
-  ║   DeepLake     : {d:<39}║
+  ║   DeepLake     : Initializing in background...           ║
   ╚══════════════════════════════════════════════════════════╝
     """)
+
     class ThreadingHTTPServer(ThreadingMixIn, HTTPServer):
         daemon_threads = True
         allow_reuse_address = True
 
-    ThreadingHTTPServer(("0.0.0.0", PORT), Handler).serve_forever()
+    server = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
+
+    # Start DeepLake connection in background — does NOT block server startup.
+    # This ensures Render's health check (HTTP port open) passes immediately,
+    # preventing crash-loop / 502/503 errors during cold starts.
+    threading.Thread(target=_init_deeplake_background, daemon=True).start()
+
+    print(f"  [Startup] Server listening on 0.0.0.0:{PORT} — ready for requests.")
+    server.serve_forever()
