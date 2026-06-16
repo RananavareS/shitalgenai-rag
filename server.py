@@ -340,7 +340,7 @@ def cosine_sim(a, b):
         return cosine_sim_dict(a, b)
     return cosine_sim_vec(a, b)
 
-def retrieve(query, user_email, top_k=4):
+def retrieve(query, user_email, top_k=6):
     chunks = get_user_chunks(user_email)
     if not chunks: return []
     q = embed(query)
@@ -349,12 +349,26 @@ def retrieve(query, user_email, top_k=4):
         key=lambda x: x[0],
         reverse=True,
     )
-    # Semantic embeddings give meaningful scores around 0.2-0.6+;
-    # TF-IDF gives smaller scores. Use a low-but-nonzero threshold either way.
-    threshold = 0.15 if _get_st_model() else 0.001
+    # TF-IDF gives small scores for code — use very low threshold
+    # but prioritize chunks from files whose name appears in the query
+    threshold = 0.15 if _get_st_model() else 0.0005
     results = [c for s, c in scored[:top_k] if s > threshold]
+
+    # Boost: if query mentions a specific filename, prioritize chunks from that file
+    query_lower = query.lower()
+    file_boost = [c for c in results if any(
+        word in query_lower for word in [
+            c["doc_name"].lower(),
+            c["doc_name"].lower().replace(".py","").replace(".js","").replace(".css","")
+        ]
+    )]
+    if file_boost:
+        # Put boosted chunks first, then fill remaining slots
+        others = [c for c in results if c not in file_boost]
+        results = file_boost + others
+
     if not results and chunks:
-        results = [c for _, c in scored[:2]]
+        results = [c for _, c in scored[:3]]
     return results
 
 
@@ -619,7 +633,7 @@ class Handler(BaseHTTPRequestHandler):
             # Build RAG context
             rag_context = ""
             if rag_on and last_user_msg and get_user_chunks(user_email):
-                hits = retrieve(last_user_msg, user_email, top_k=4)
+                hits = retrieve(last_user_msg, user_email, top_k=6)
                 if hits:
                     # Truncate each chunk's text to keep total prompt size small
                     MAX_CHUNK_CHARS = 800
